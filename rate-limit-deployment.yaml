@@ -1,0 +1,177 @@
+# Copyright Istio Authors
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+##################################################################################################
+# Redis service and deployment
+# Ratelimit service and deployment
+
+# Note: a configmap is needed to make the rate limit deployment work properly, for example:
+#
+#  apiVersion: v1
+#  kind: ConfigMap
+#  metadata:
+#    name: ratelimit-config
+#  data:
+#    config.yaml: |
+#      domain: echo-ratelimit
+#      descriptors:
+#        - key: PATH
+#          value: "/ip"
+#          rate_limit:
+#            unit: minute
+#            requests_per_unit: 1
+#        - key: PATH
+#          value: "/headers"
+#          rate_limit:
+#            unit: minute
+#            requests_per_unit: 3            
+#        - key: PATH
+#          rate_limit:
+#            unit: minute
+#            requests_per_unit: 10    
+#        - key: header_match
+#          value: get
+#          descriptors:
+#          - key: service
+#            value: boo
+#            rate_limit:
+#              requests_per_unit: 3
+#              unit: second 
+## Limit requests                              
+##################################################################################################
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app: redis
+spec:
+  ports:
+  - name: redis
+    port: 6379
+  selector:
+    app: redis
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - image: redis:alpine
+        imagePullPolicy: Always
+        name: redis
+        ports:
+        - name: redis
+          containerPort: 6379
+      restartPolicy: Always
+      serviceAccountName: ""
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ratelimit
+  labels:
+    app: ratelimit
+spec:
+  ports:
+  - name: http-port   # healthcheck and json endpoint
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  - name: grpc-port   # GRPC endpoint
+    port: 8081
+    targetPort: 8081
+    protocol: TCP
+  - name: http-debug  # debug endpoint
+    port: 6070
+    targetPort: 6070
+    protocol: TCP
+  selector:
+    app: ratelimit
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ratelimit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ratelimit
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: ratelimit
+    spec:
+      containers:
+      - image: envoyproxy/ratelimit:6f5de117 # 2021/01/08
+        imagePullPolicy: Always
+        name: ratelimit
+        command: ["/bin/ratelimit"]
+        env:
+        - name: LOG_LEVEL
+          value: debug
+        - name: REDIS_SOCKET_TYPE
+          value: tcp
+        - name: REDIS_URL
+          value: redis:6379 # Change this to our Redis implementation. Create separate DB for this.
+        - name: USE_STATSD
+          value: "false"
+        - name: RUNTIME_ROOT
+          value: /data
+        - name: RUNTIME_SUBDIRECTORY # this allows us to update the contents of RUNTIME_ROOT/RUNTIME_SUBDIRECTORY/config/ directly via a config map as volume mount
+          value: ratelimit
+          # need to set RUNTIME_IGNOREDOTFILES to true to avoid issues with
+          # how Kubernetes mounts configmaps into pods.
+        - name: RUNTIME_IGNOREDOTFILES #  this takes care of the ../data warnings
+          value: "true"
+        - name: RUNTIME_WATCH_ROOT
+          value: "false"
+        ports:
+        - containerPort: 8080
+        - containerPort: 8081
+        - containerPort: 6070
+        resources:
+          limits:
+            cpu: 1500m
+            memory: 512Mi
+          requests:
+            cpu: 200m
+            memory: 256Mi     
+            
+  #      volumeMounts:
+  #      - name: config-volume
+  #        mountPath: /data/ratelimit/config/config.yaml
+  #        subPath: config.yaml
+        volumeMounts:
+        - name: ratelimit-config
+          mountPath: /data/ratelimit/config
+          readOnly: true        
+      volumes:
+      - name: ratelimit-config
+        configMap:
+          name: ratelimit-config       

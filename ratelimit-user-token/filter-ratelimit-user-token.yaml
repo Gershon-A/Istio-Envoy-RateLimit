@@ -1,0 +1,201 @@
+
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: ratelimit-config
+  data:
+    config-user-token-gw.yaml: | 
+      domain: user-token
+      descriptors:
+        # For the stage0 anonymous users: we can achieve that by applying    
+      - key: header_match
+       # gets sent everytime the Authorization header isn't present an gets throttled at 2/min.
+        value: quote-path-auth
+        rate_limit:
+          unit: minute
+          requests_per_unit: 2 
+        # For the stage1 Users with auth: we can achieve that by applying  
+      - key: header_match
+        value: quote-path-user-limit
+        descriptors:
+        # Each unique value for the authorization header is granted its own counter since the value itself isn’t specified for the auth_token
+        - key: auth_token
+          rate_limit:
+            unit: minute
+            requests_per_unit: 5
+      - key: header_match
+        value: quote-path-vip
+        descriptors:
+        - key: service-level
+          value: "enhanced"  
+          rate_limit:
+            unit: minute
+            requests_per_unit: 15
+        - key: service-level
+          value: "basic"  
+          rate_limit:
+            unit: minute
+            requests_per_unit: 7
+
+
+                
+    # descriptors:
+    #     # For the stage0 anonymous users: we can achieve that by applying
+    #   - key: header_match
+    #     # gets sent everytime the Authorization header isn't present an gets throttled at 2/min.
+    #     value: quote-path-auth 
+    #     rate_limit:
+    #       unit: minute
+    #       requests_per_unit: 2  
+
+    #     # For the stage1 Users with auth: we can achieve that by applying
+    #   - key: header_match
+    #     # Each unique value for the authorization header is granted its own counter since the value itself isn’t specified for the auth_token
+    #     value: quote-path-user-limit
+    #     descriptors:
+    #     - key: auth_token 
+    #       rate_limit:
+    #         unit: minute
+    #         requests_per_unit: 5  
+
+                      
+# stage0: Anonymous users (not auth token) are allowed 2 req/min of any service level
+# stage1: Users with auth allowed up to 5 req/min of any service level
+# Users with auth and “enhanced” service level allowed 10 req/min
+# Users with auth and “basic” service level allowed 15 req/min             
+---            
+########################################
+# EnvoyFilter to the ingressgateway to enable global rate limiting using Envoy’s global rate limit filter.
+########################################
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: filter-ratelimit-user-token
+  namespace: istio-system
+spec:
+  workloadSelector:
+    # select by label in the same namespace
+    labels:
+      istio: ingressgateway
+  configPatches:
+    # The Envoy config you want to modify
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+              subFilter:
+                name: "envoy.filters.http.router"
+      patch:
+        operation: INSERT_BEFORE
+        # Adds the Envoy Rate Limit Filter in HTTP filter chain.
+        value:
+          name: envoy.filters.http.ratelimit
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
+            # domain can be anything! Match it to the ratelimter service config
+            domain: user-token  # must match domain in ratelimit ConfigMap
+            # When it is set to true, Envoy will not allow traffic in case of communication failure between rate limiting service and the proxy.
+            failure_mode_deny: true # run plugin in fail-open mode, no limiting happens if ratelimit is unavailable
+            stage: 1     
+            request_type: external
+            rate_limit_service:
+              grpc_service:
+                envoy_grpc:
+                  cluster_name: rate_limit_cluster
+                timeout: 10s
+              transport_api_version: V3
+    - applyTo: CLUSTER
+      match:
+        cluster:
+          service: ratelimit.default.svc.cluster.local
+      patch:
+        operation: ADD
+        # Adds the rate limit service cluster for rate limit service defined in step 1.
+        value:
+          name: rate_limit_cluster
+          type: STRICT_DNS
+          connect_timeout: 10s
+          lb_policy: ROUND_ROBIN
+          http2_protocol_options: {}
+          load_assignment:
+            cluster_name: rate_limit_cluster
+            endpoints:
+            - lb_endpoints:
+              - endpoint:
+                  address:
+                     socket_address:
+                      address: ratelimit.default.svc.cluster.local # ratelimit Service 
+                      port_value: 8081                             # and port exposed by the Service
+---
+#########################################
+#  EnvoyFilter to supply envoy ratelimit filters
+#  This adds rate limit actions for any route from a virtual host named *.80.
+########################################
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: filter-ratelimit-user-token-action
+  namespace: istio-system
+spec:
+  workloadSelector:
+    labels:
+      istio: ingressgateway
+  configPatches:
+    - applyTo: VIRTUAL_HOST
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+          #  name: "*:80" # External requests. Must be a domain and port from VirrualService config.
+            name: "httpbin-jwt.duckdns.org:80" # External requests. Must be a domain and port from VirrualService config.
+            route:
+              action: ANY
+      patch:
+        operation: MERGE
+        # Applies the rate limit rules.
+        value:
+            rate_limits:
+            - actions:                                 
+              - header_value_match:
+                  descriptor_value: quote-path-auth
+                  expect_match: false
+                  headers:
+                  - name: ":path"
+                    exact_match: "/get"
+                  - name: "Authorization"                      
+              stage: 0
+            - actions:                                 
+              - header_value_match:
+                  descriptor_value: quote-path-user-limit
+                  headers:
+                  - name: ":path"
+                    exact_match: "/get"
+              - request_headers:
+                  header_name: "Authorization"
+                  descriptor_key: auth_token                                    
+              stage: 1                              
+            - actions:
+              - header_value_match:
+                  descriptor_value: quote-path-vip
+                  headers:
+                  - name: ":path"
+                    exact_match: "/get"                                       
+              - request_headers:
+                  header_name: "x-service-level"
+                  descriptor_key: service-level                    
+              stage: 1
+                
+     #      rate_limits: 
+     #        - actions: # any actions in here
+     #            # Multiple actions nest the descriptors
+     #            # https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/rate_limit_filter#config-http-filters-rate-limit-composing-actions
+     #            # - generic_key:
+     #                # descriptor_value: "test"
+     #            - request_headers:
+     #                header_name: "Authorization"
+     #                descriptor_key: "auth"
+     #            # - remote_address: {}
+     #            # - destination_cluster: {}            

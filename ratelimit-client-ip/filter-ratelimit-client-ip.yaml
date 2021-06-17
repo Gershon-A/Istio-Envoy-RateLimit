@@ -1,0 +1,118 @@
+# Note: a configmap is needed to make the rate limit deployment work properly, for example:
+#
+  apiVersion: v1
+  kind: ConfigMap
+  metadata:
+    name: ratelimit-config
+  data:
+    config-requests-per-ip-gw.yaml: |
+      domain: requests-per-ip-gw
+      descriptors:
+          # each unique remote address (i.e. client IP)
+          # is limited to 5 requests per minute.
+        - key: remote_address
+          rate_limit:
+            unit: minute 
+            requests_per_unit: 5         
+       
+# Limit requests     
+# "minute" - for testing only. Should be in "second".           
+#   key: PATH - we enter restriction latter in the filter      
+#       domain: user-token-ip      
+##################################################################################################
+---
+########################################
+# EnvoyFilter to the ingressgateway to enable global rate limiting using Envoy’s global rate limit filter.
+########################################
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: filter-ratelimit-client-ip
+  namespace: istio-system
+spec:
+  workloadSelector:
+    # select by label in the same namespace
+    labels:
+      istio: ingressgateway
+  configPatches:
+    # The Envoy config you want to modify
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: "envoy.filters.network.http_connection_manager"
+              subFilter:
+                name: "envoy.filters.http.router"
+      patch:
+        operation: INSERT_BEFORE
+        # Adds the Envoy Rate Limit Filter in HTTP filter chain.
+        value:
+          name: envoy.filters.http.ratelimit
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
+            # domain can be anything! Match it to the ratelimter service config
+            domain: requests-per-ip-gw  # must match domain in ratelimit ConfigMap
+            # When it is set to true, Envoy will not allow traffic in case of communication failure between rate limiting service and the proxy.
+            failure_mode_deny: false # run plugin in fail-open mode, no limiting happens if ratelimit is unavailable
+            rate_limit_service:
+              grpc_service:
+                envoy_grpc:
+                  cluster_name: rate_limit_cluster
+                timeout: 10s
+              transport_api_version: V3
+    - applyTo: CLUSTER
+      match:
+        cluster:
+          service: ratelimit.default.svc.cluster.local
+      patch:
+        operation: ADD
+        # Adds the rate limit service cluster for rate limit service defined in step 1.
+        value:
+          name: rate_limit_cluster
+          type: STRICT_DNS
+          connect_timeout: 10s
+          lb_policy: ROUND_ROBIN
+          http2_protocol_options: {}
+          load_assignment:
+            cluster_name: rate_limit_cluster
+            endpoints:
+            - lb_endpoints:
+              - endpoint:
+                  address:
+                     socket_address:
+                      address: ratelimit.default.svc.cluster.local # ratelimit Service 
+                      port_value: 8081                             # and port exposed by the Service
+---
+#########################################
+#  EnvoyFilter to supply envoy ratelimit filters
+#  This adds rate limit actions for any route from a virtual host named *.80.
+########################################
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: filter-ratelimit-client-ip-action
+  namespace: istio-system
+spec:
+  workloadSelector:
+    labels:
+      istio: ingressgateway
+  configPatches:
+    - applyTo: VIRTUAL_HOST
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+          #  name: "*:80" # External requests. Must be a domain and port from VirrualService config.
+            name: "httpbin-tp-dev1.duckdns.org:80" # External requests. Must be a domain and port from VirrualService config.
+            route:
+              action: ANY
+      patch:
+        operation: MERGE
+        # Applies the rate limit rules.
+        value:
+            rate_limits: 
+              - actions:
+                  - remote_address: {}                       
+              
